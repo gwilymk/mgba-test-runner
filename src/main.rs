@@ -1,67 +1,89 @@
+#![allow(clippy::all)]
+
+mod runner;
 use anyhow::{anyhow, Error};
 use io::Write;
-use nix::{sys::signal, unistd::Pid};
 use regex::Regex;
-use std::{
-    convert::TryInto,
-    io,
-    io::BufRead,
-    io::BufReader,
-    process::{Child, Command, Stdio},
-};
+use std::cell::RefCell;
+use std::io;
+use std::path::Path;
+use std::rc::Rc;
 
-fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let args: Vec<String> = std::env::args().collect();
-    let file_to_run = args.get(1).expect("you should provide file to run");
-
-    let mut command = Command::new("mgba-qt")
-        .args(&["-l", "31", "-d", "-C", "logToStdout=1"])
-        .arg(file_to_run)
-        .stdout(Stdio::piped())
-        .spawn()?;
-
-    monitor_mgba(&mut command)?;
-
-    Ok(())
+#[derive(PartialEq, Eq, Debug, Clone)]
+enum Status {
+    Running,
+    Failed,
+    Sucess,
 }
 
-fn monitor_mgba(command: &mut Child) -> Result<(), Error> {
-    let stdout = command.stdout.take().expect("expected stdout to exist");
+fn test_file(file_to_run: &str) -> Status {
+    let finished = Rc::new(RefCell::new(Status::Running));
+    let debug_reader_mutex = Regex::new(r"^\[(.*)\] GBA Debug: (.*)$").unwrap();
 
-    let reader = BufReader::new(stdout);
-
-    let regex = Regex::new(r"^\[(.*)\] GBA Debug: (.*)$").unwrap();
-
-    let mut tests_result = Ok(());
-
-    for line in reader.lines().filter_map(|line| line.ok()) {
-        if let Some(captures) = regex.captures(line.as_str()) {
+    let fin_closure = Rc::clone(&finished);
+    runner::set_logger(Box::new(move |message| {
+        if let Some(captures) = debug_reader_mutex.captures(message) {
             let log_level = &captures[1];
             let out = &captures[2];
+
             if out.ends_with("...") {
                 print!("{}", out);
-                io::stdout().flush()?;
+                io::stdout().flush().expect("can't flush stdout");
             } else {
                 println!("{}", out);
             }
 
             if log_level == "FATAL" {
-                send_sigint_to_process(command)?;
-                tests_result = Err(anyhow!("Tests failed"));
+                let mut done = fin_closure.borrow_mut();
+                *done = Status::Failed;
             }
+
             if out == "Tests finished successfully" {
-                send_sigint_to_process(command)?;
-                tests_result = Ok(());
+                let mut done = fin_closure.borrow_mut();
+                *done = Status::Sucess;
             }
-        } else {
-            println!("{}", line);
+        }
+    }));
+
+    let mut mgba = runner::MGBA::new(file_to_run);
+
+    loop {
+        mgba.advance_frame();
+        let done = finished.borrow();
+        if *done != Status::Running {
+            break;
         }
     }
 
-    tests_result
+    runner::clear_logger();
+
+    return (*finished.borrow()).clone();
 }
 
-fn send_sigint_to_process(child: &Child) -> Result<(), Error> {
-    signal::kill(Pid::from_raw(child.id().try_into()?), signal::SIGINT)?;
-    Ok(())
+fn main() -> Result<(), Error> {
+    let args: Vec<String> = std::env::args().collect();
+    let file_to_run = args.get(1).expect("you should provide file to run");
+
+    if !Path::new(file_to_run).exists() {
+        return Err(anyhow!("File to run should exist!"));
+    }
+
+    let output = test_file(file_to_run);
+
+    match output {
+        Status::Failed => Err(anyhow!("Tests failed!")),
+        Status::Sucess => Ok(()),
+        _ => {
+            unreachable!("very bad thing happened");
+        }
+    }
+}
+
+fn gba_colour_to_rgba(colour: u32) -> [u8; 4] {
+    [
+        (((((colour) << 3) & 0xF8) * 0x21) >> 5) as u8,
+        (((((colour) >> 2) & 0xF8) * 0x21) >> 5) as u8,
+        (((((colour) >> 7) & 0xF8) * 0x21) >> 5) as u8,
+        255,
+    ]
 }
