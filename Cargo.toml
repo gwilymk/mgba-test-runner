@@ -8,4 +8,5 @@ edition = "2018"
 
 [dependencies]
 regex = "1"
-thiserror = "1.0"
+nix = "0.20.0"
+anyhow = "1.0"
